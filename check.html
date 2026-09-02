@@ -46,7 +46,9 @@
       <thead><tr><th style="width:52%">服务</th><th style="width:24%">结果</th><th style="width:24%">耗时</th></tr></thead>
       <tbody></tbody>
     </table>
-    <div class="note">「可连通」只说明网络能到达，不代表服务一定可用；「不通」基本可以确定这条路走不了。</div>
+    <div class="note">判读方式：<b>「可连通」是强信号</b>——网络确实到得了这个服务。
+      <b>「不通」是较弱的信号</b>，多数情况是被墙，但也可能是对方临时故障。
+      最后一行 Google 是对照组：它如果显示「可连通」，说明你还挂着 VPN，请关掉重测。</div>
     <textarea id="out" readonly hidden></textarea>
   </div>
 </div>
@@ -54,15 +56,18 @@
 <script>
 /* 跨域读不到响应内容，所以用 no-cors：请求能完成 = 网络可达；
    被墙 / DNS 污染的域名会直接抛错或超时。 */
+/* 探测地址一律挑「不会发生跳转」的：no-cors 请求遇到跳转会直接报错，
+   那会把本来通的服务误判成不通。 */
 var TESTS = [
-  { name: '本站（GitHub Pages）', why: '考试网站现在就放在这里', url: 'https://angran.github.io/english-test/index.html', key: 'github-pages' },
+  { name: '本站（GitHub Pages）', why: '考试网站现在就放在这里', url: 'https://angran.github.io/english-test/favicon-probe.txt', key: 'github-pages' },
   { name: 'EmailJS', why: '浏览器直接发邮件，可绑定 126 / QQ 邮箱', url: 'https://api.emailjs.com/api/v1.0/email/send', key: 'emailjs' },
   { name: 'Web3Forms', why: '填个邮箱拿密钥就能用，最省事', url: 'https://api.web3forms.com/submit', key: 'web3forms' },
-  { name: 'Formspree', why: '同类表单转邮件服务', url: 'https://formspree.io/', key: 'formspree' },
+  { name: 'Formspree', why: '同类表单转邮件服务', url: 'https://formspree.io/favicon.ico', key: 'formspree' },
   { name: '企业微信机器人', why: '国内直连，可发群消息代替邮件', url: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send', key: 'wecom' },
-  { name: '飞书机器人', why: '同上，国内直连', url: 'https://open.feishu.cn/open-apis/bot/v2/hook/test', key: 'feishu' },
-  { name: '腾讯云函数（华南）', why: '国内后端方案的落点', url: 'https://service-0-1234567890.gz.apigw.tencentcs.com/', key: 'tencent-scf' },
-  { name: 'Google Apps Script', why: '对照组，预期不通', url: 'https://script.google.com/', key: 'google' }
+  { name: '飞书机器人', why: '同上，国内直连', url: 'https://open.feishu.cn/open-apis/bot/v2/hook/probe', key: 'feishu' },
+  { name: '腾讯云对象存储（广州）', why: '国内后端 / 录音存储方案的落点', url: 'https://cos.ap-guangzhou.myqcloud.com/', key: 'tencent-cos' },
+  { name: '阿里云对象存储（杭州）', why: '同上', url: 'https://oss-cn-hangzhou.aliyuncs.com/', key: 'aliyun-oss' },
+  { name: 'Google（对照组）', why: '预期不通，用来确认检测本身有效', url: 'https://www.gstatic.com/generate_204', key: 'google' }
 ];
 
 var TIMEOUT = 8000;
