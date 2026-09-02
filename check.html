@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>连通性自检 · 英语能力测试</title>
+<style>
+  :root{--ink:#1c2128;--soft:#5b6570;--line:#e2e6ea;--brand:#1f5f8b;--ok:#1a7f5a;--bad:#b3261e;--warn:#b26a00}
+  *{box-sizing:border-box}
+  body{margin:0;padding:24px 16px 60px;background:#f6f7f9;color:var(--ink);
+       font-family:"Segoe UI",system-ui,-apple-system,"Microsoft YaHei",sans-serif;line-height:1.6}
+  .wrap{max-width:720px;margin:0 auto}
+  h1{font-size:21px;margin:0 0 6px}
+  .lead{color:var(--soft);margin:0 0 20px;font-size:14px}
+  .card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin-bottom:16px}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{border-bottom:1px solid var(--line);padding:9px 6px;text-align:left;vertical-align:top}
+  th{font-size:12px;color:var(--soft);font-weight:600;letter-spacing:.5px}
+  td.s{white-space:nowrap;font-weight:600}
+  .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.muted{color:var(--soft)}
+  .name{font-weight:600}
+  .why{display:block;color:var(--soft);font-size:12px;font-weight:400;margin-top:2px}
+  button{font-family:inherit;font-size:15px;padding:9px 18px;border-radius:7px;border:1px solid var(--brand);
+         background:var(--brand);color:#fff;cursor:pointer;font-weight:600}
+  button.ghost{background:#fff;color:var(--ink);border-color:var(--line);font-weight:400}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;align-items:center}
+  textarea{width:100%;height:150px;margin-top:12px;font-family:ui-monospace,Consolas,monospace;font-size:12px;
+           border:1px solid var(--line);border-radius:7px;padding:10px}
+  .note{background:#fff8e6;border:1px solid #f0dca4;border-radius:7px;padding:10px 14px;font-size:13px;margin-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>连通性自检</h1>
+  <p class="lead">请在<b>中国境内网络、不挂 VPN</b> 的情况下打开本页，点「开始检测」。<br>
+     结果用来决定考试网站的邮件通知走哪条路。整个过程不发送任何数据，只测能否连通。</p>
+
+  <div class="card">
+    <div class="actions">
+      <button id="run">开始检测</button>
+      <button class="ghost" id="copy" disabled>复制结果</button>
+      <span class="muted" id="prog"></span>
+    </div>
+    <table id="tbl">
+      <thead><tr><th style="width:52%">服务</th><th style="width:24%">结果</th><th style="width:24%">耗时</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="note">「可连通」只说明网络能到达，不代表服务一定可用；「不通」基本可以确定这条路走不了。</div>
+    <textarea id="out" readonly hidden></textarea>
+  </div>
+</div>
+
+<script>
+/* 跨域读不到响应内容，所以用 no-cors：请求能完成 = 网络可达；
+   被墙 / DNS 污染的域名会直接抛错或超时。 */
+var TESTS = [
+  { name: '本站（GitHub Pages）', why: '考试网站现在就放在这里', url: 'https://angran.github.io/english-test/index.html', key: 'github-pages' },
+  { name: 'EmailJS', why: '浏览器直接发邮件，可绑定 126 / QQ 邮箱', url: 'https://api.emailjs.com/api/v1.0/email/send', key: 'emailjs' },
+  { name: 'Web3Forms', why: '填个邮箱拿密钥就能用，最省事', url: 'https://api.web3forms.com/submit', key: 'web3forms' },
+  { name: 'Formspree', why: '同类表单转邮件服务', url: 'https://formspree.io/', key: 'formspree' },
+  { name: '企业微信机器人', why: '国内直连，可发群消息代替邮件', url: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send', key: 'wecom' },
+  { name: '飞书机器人', why: '同上，国内直连', url: 'https://open.feishu.cn/open-apis/bot/v2/hook/test', key: 'feishu' },
+  { name: '腾讯云函数（华南）', why: '国内后端方案的落点', url: 'https://service-0-1234567890.gz.apigw.tencentcs.com/', key: 'tencent-scf' },
+  { name: 'Google Apps Script', why: '对照组，预期不通', url: 'https://script.google.com/', key: 'google' }
+];
+
+var TIMEOUT = 8000;
+var results = [];
+
+function probe(t) {
+  var t0 = performance.now();
+  var ctl = new AbortController();
+  var timer = setTimeout(function () { ctl.abort(); }, TIMEOUT);
+  return fetch(t.url, { mode: 'no-cors', signal: ctl.signal, cache: 'no-store' })
+    .then(function () {
+      clearTimeout(timer);
+      return { ok: true, ms: Math.round(performance.now() - t0) };
+    })
+    .catch(function (e) {
+      clearTimeout(timer);
+      return { ok: false, ms: Math.round(performance.now() - t0), err: e.name === 'AbortError' ? '超时' : '连接失败' };
+    });
+}
+
+document.getElementById('run').onclick = async function () {
+  var btn = this; btn.disabled = true;
+  var tb = document.querySelector('#tbl tbody');
+  tb.innerHTML = ''; results = [];
+  for (var i = 0; i < TESTS.length; i++) {
+    var t = TESTS[i];
+    document.getElementById('prog').textContent = '检测中 ' + (i + 1) + '/' + TESTS.length + '…';
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td><span class="name">' + t.name + '</span><span class="why">' + t.why + '</span></td>' +
+                   '<td class="s muted">检测中…</td><td class="muted">—</td>';
+    tb.appendChild(tr);
+    var r = await probe(t);
+    var slow = r.ok && r.ms > 3000;
+    tr.children[1].className = 's ' + (r.ok ? (slow ? 'warn' : 'ok') : 'bad');
+    tr.children[1].textContent = r.ok ? (slow ? '慢，但可连通' : '可连通') : ('不通（' + r.err + '）');
+    tr.children[2].textContent = r.ms + ' ms';
+    results.push({ name: t.name, key: t.key, ok: r.ok, ms: r.ms, err: r.err || '' });
+  }
+  document.getElementById('prog').textContent = '检测完成';
+  var lines = ['连通性自检结果  ' + new Date().toLocaleString('zh-CN')];
+  lines.push('浏览器: ' + navigator.userAgent);
+  results.forEach(function (r) {
+    lines.push((r.ok ? '[通] ' : '[不通] ') + r.name + '  ' + r.ms + 'ms' + (r.err ? ' ' + r.err : ''));
+  });
+  var ta = document.getElementById('out');
+  ta.value = lines.join('\n'); ta.hidden = false;
+  document.getElementById('copy').disabled = false;
+  btn.disabled = false; btn.textContent = '重新检测';
+};
+
+document.getElementById('copy').onclick = function () {
+  var ta = document.getElementById('out');
+  ta.select();
+  if (navigator.clipboard) navigator.clipboard.writeText(ta.value);
+  else document.execCommand('copy');
+  this.textContent = '已复制';
+  var b = this; setTimeout(function () { b.textContent = '复制结果'; }, 1800);
+};
+</script>
+</body>
+</html>
