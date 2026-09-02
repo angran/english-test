@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>英语能力测试 · English Proficiency Test</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header id="topbar">
+  <div class="wrap">
+    <div class="brand">English Proficiency Test<span class="sub">阅读 · 听力 · 写作 · 口语</span></div>
+    <div id="topmeta"></div>
+  </div>
+</header>
+
+<nav id="steps" class="hidden">
+  <div class="wrap">
+    <ol>
+      <li data-step="reading"><span>1</span>Reading 阅读</li>
+      <li data-step="listening"><span>2</span>Listening 听力</li>
+      <li data-step="writing"><span>3</span>Writing 写作</li>
+      <li data-step="speaking"><span>4</span>Speaking 口语</li>
+      <li data-step="submit"><span>5</span>提交</li>
+    </ol>
+    <div id="timer" class="hidden"><span id="timer-label">剩余</span> <b id="timer-value">--:--</b></div>
+  </div>
+</nav>
+
+<main id="app" class="wrap"></main>
+
+<footer><div class="wrap">离线单机版 · 不上传任何数据 · 所有作答仅保存在本机浏览器</div></footer>
+
+<script src="config.js"></script>
+<script src="bank/_core.js"></script>
+<script src="bank/a2.js"></script>
+<script src="bank/b1.js"></script>
+<script src="bank/b2.js"></script>
+<script src="bank/c1.js"></script>
+<script src="bank/c2.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
