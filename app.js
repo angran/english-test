@@ -64,11 +64,21 @@ function todayStr() {
 const MAIL = {
   mode() {
     if (typeof google !== 'undefined' && google.script && google.script.run) return 'gas';
+    if (window.EET_CONFIG && EET_CONFIG.WEBHOOK_URL) return 'webhook';
     if (window.EET_CONFIG && EET_CONFIG.ENDPOINT_URL) return 'http';
     return 'none';
   },
   modeText() {
-    return { gas: '已连通（Apps Script 内部通道）', http: '已配置（跨域发送，无法确认送达）', none: '未配置' }[this.mode()];
+    return {
+      gas: '已连通（Apps Script 内部通道）',
+      webhook: '群机器人（' + (this.bot() === 'feishu' ? '飞书' : '企业微信') + '）',
+      http: '已配置（跨域发送，无法确认送达）',
+      none: '未配置'
+    }[this.mode()];
+  },
+  bot() {
+    const u = (window.EET_CONFIG && EET_CONFIG.WEBHOOK_URL) || '';
+    return /feishu|larksuite/i.test(u) ? 'feishu' : 'wecom';
   },
   /* 不让考生卡在「正在通知考官」上：超时就当失败，转入本地队列稍后补发 */
   sendTimeout(payload, ms) {
@@ -77,8 +87,92 @@ const MAIL = {
       new Promise(res => setTimeout(() => res({ ok: false, mode: this.mode(), detail: '发送超时' }), ms || 15000))
     ]);
   },
+  /* ---- 群机器人：把结构化载荷排成人能读的消息 ---- */
+  /* 各家上限不同，超了对方直接拒收，所以按机器人类型分别留余量：
+     企业微信 text 上限 2048 字节，飞书宽松得多。
+     一律用 text 类型而不是 markdown——考生作文里可能有 * # 之类的符号，
+     markdown 会把它们当格式渲染，改变原文观感。 */
+  chunkBytes() { return this.bot() === 'feishu' ? 3500 : 1900; },
+  bytes(s) { return new Blob([s]).size; },
+
+  splitMessage(text) {
+    const LIMIT = this.chunkBytes();
+    if (this.bytes(text) <= LIMIT) return [text];
+    const lines = text.split('\n'), out = [];
+    let buf = '';
+    for (const ln of lines) {
+      if (buf && this.bytes(buf + '\n' + ln) > LIMIT) { out.push(buf); buf = ln; }
+      else buf = buf ? buf + '\n' + ln : ln;
+      /* 单行本身就超长（一整段写作往往没有换行），按字符硬切。
+         中英混排时字节数和字符数不成比例，所以按比例估算后再逐步收缩。 */
+      while (this.bytes(buf) > LIMIT) {
+        let cut = Math.max(1, Math.floor(buf.length * LIMIT / this.bytes(buf)));
+        while (cut > 1 && this.bytes(buf.slice(0, cut)) > LIMIT) cut--;
+        out.push(buf.slice(0, cut)); buf = buf.slice(cut);
+      }
+    }
+    if (buf) out.push(buf);
+    return out.map((t, i) => '（' + (i + 1) + '/' + out.length + '）\n' + t);
+  },
+
+  compose(d) {
+    const kw = (window.EET_CONFIG && EET_CONFIG.WEBHOOK_KEYWORD) || '英语测试';
+    if (d.kind === 'start') {
+      return ['【' + kw + '】开考',
+        '考生：' + d.name,
+        '开始时间：' + d.startedAt + (d.tz ? '（' + d.tz + '）' : ''),
+        '词汇量 ' + d.vocab + ' → ' + d.band + ' 卷（微调档 ' + d.neighbor + '）',
+        '试卷编号：' + d.code,
+        '构成：' + d.paper].join('\n');
+    }
+    if (d.kind === 'finish') {
+      const head = ['【' + kw + '】交卷',
+        '考生：' + d.name + '　编号 ' + d.code,
+        '用时 ' + (d.duration || '—') + '（' + d.startedAt + ' → ' + d.finishedAt + '）',
+        '阅读 ' + d.reading.correct + '/' + d.reading.total +
+        '　听力 ' + d.listening.correct + '/' + d.listening.total +
+        '　正确率 ' + d.percent + '%',
+        '推算水平：' + d.estLevel + '（约 ' + d.estVocab + ' 词）',
+        d.note || ''].join('\n');
+      const writing = (d.writing || []).map(w =>
+        '\n—— 写作 Task ' + w.task + '（' + w.words + ' 词 / 要求 ' + w.required + '）——\n' + w.text).join('\n');
+      const spk = (d.speaking || []);
+      const done = spk.filter(s => s.file).length;
+      const tail = '\n—— 口语 ——\n' + (done
+        ? done + ' 题已录音。群机器人发不了音频，请考生把结果包（zip）发给考官。'
+        : '未提交音频。');
+      return head + '\n' + writing + tail;
+    }
+    return '【' + kw + '】' + JSON.stringify(d).slice(0, 500);
+  },
+
+  async postWebhook(payload) {
+    const url = EET_CONFIG.WEBHOOK_URL;
+    const parts = this.splitMessage(this.compose(payload));
+    const isFeishu = this.bot() === 'feishu';
+    try {
+      for (const text of parts) {
+        const body = isFeishu
+          ? { msg_type: 'text', content: { text: text } }
+          : { msgtype: 'text', text: { content: text } };
+        /* 必须用 text/plain：application/json 会触发 CORS 预检，
+           而这两个 webhook 都不返回 CORS 头，预检必然失败、请求根本发不出去。
+           它们的服务端不校验 Content-Type，照样能解析 JSON 体。 */
+        await fetch(url, {
+          method: 'POST', mode: 'no-cors',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify(body)
+        });
+      }
+      return { ok: true, mode: 'webhook', detail: '已推送 ' + parts.length + ' 条' };
+    } catch (e) {
+      return { ok: false, mode: 'webhook', detail: e.message };
+    }
+  },
+
   send(payload) {
     const mode = this.mode();
+    if (mode === 'webhook') return this.postWebhook(payload);
     if (mode === 'gas') {
       return new Promise(res => {
         google.script.run
@@ -1126,6 +1220,7 @@ function renderResult() {
       <div class="lv">${esc(r.estBand.cefr)} · ${esc(r.estBand.name)}</div>
       <div class="small">对应词汇量约 ${esc(r.estVocab)} 词。${esc(r.note)}</div>
     </div>
+    ${audioHandoffHTML()}
     ${mailStatusHTML()}
     <div class="actions">
       ${EET_CONFIG.KEEP_LOCAL_ZIP ? '<button class="primary" id="btn-zip">下载结果包（含录音 .zip）</button>' : ''}
@@ -1175,10 +1270,25 @@ function renderResult() {
   $('#btn-new').onclick = () => { if (confirm('放弃当前结果，回到出卷页面？')) { S.exam = null; S.submitted = false; go('setup'); } };
 }
 
+/* 口语录音不随通知走（群机器人发不了音频），所以要明确告诉考生：
+   得自己下载结果包发给考官。否则口语这部分就悄无声息地丢了。 */
+function audioHandoffHTML() {
+  const has = S.ans.speaking.filter(Boolean).length;
+  if (!has || !EET_CONFIG.KEEP_LOCAL_ZIP) return '';
+  const uploaded = MAIL.mode() !== 'none' && EET_CONFIG.SEND_AUDIO;
+  if (uploaded) return '';
+  return `<div class="notice" style="margin-top:14px">
+    <b>还有一步：请把口语录音发给考官</b>
+    <div>成绩和写作已经自动发送，但${has} 段口语录音需要你手动提交。</div>
+    <div>请点下面的 <b>「下载结果包」</b>，把得到的 zip 文件发给考官（微信或邮件都行）。</div>
+  </div>`;
+}
+
 function mailStatusHTML() {
   const line = (label, r) => {
     if (!r) return `<div>${label}：<span class="muted">未发送</span></div>`;
     if (r.ok && r.mode === 'gas') return `<div>${label}：<span class="tick">✔ 已发送给考官</span></div>`;
+    if (r.ok && r.mode === 'webhook') return `<div>${label}：<span class="tick">✔ 已推送到考官群</span> <span class="muted small">（浏览器读不到对方响应，无法确认对方是否收到）</span></div>`;
     if (r.ok && r.mode === 'http') return `<div>${label}：<span class="tick">✔ 已发出</span> <span class="muted small">（跨域方式无法确认送达，请考官核对收件箱）</span></div>`;
     if (r.mode === 'none') return `<div>${label}：<span class="muted">未配置邮件服务</span></div>`;
     return `<div>${label}：<span class="cross">✘ 发送失败</span> <span class="muted small">${esc(r.detail || '')}</span></div>`;
