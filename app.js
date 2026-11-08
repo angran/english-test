@@ -57,160 +57,7 @@ function todayStr() {
 }
 
 /* ------------------------------------------------------ 邮件通道 ---- */
-/* 三种运行环境：
-   gas  —— 页面由 Google Apps Script 托管，用内部通道调用，有成功/失败回执
-   http —— 页面在别的静态空间，跨域 POST 到 /exec，只能发出去、拿不到回执
-   none —— 没配置，考试照常进行，结果页给出提醒和补发按钮 */
-const MAIL = {
-  mode() {
-    if (typeof google !== 'undefined' && google.script && google.script.run) return 'gas';
-    if (window.EET_CONFIG && EET_CONFIG.WEBHOOK_URL) return 'webhook';
-    if (window.EET_CONFIG && EET_CONFIG.ENDPOINT_URL) return 'http';
-    return 'none';
-  },
-  modeText() {
-    return {
-      gas: '已连通（Apps Script 内部通道）',
-      webhook: '群机器人（' + (this.bot() === 'feishu' ? '飞书' : '企业微信') + '）',
-      http: '已配置（跨域发送，无法确认送达）',
-      none: '未配置'
-    }[this.mode()];
-  },
-  bot() {
-    const u = (window.EET_CONFIG && EET_CONFIG.WEBHOOK_URL) || '';
-    return /feishu|larksuite/i.test(u) ? 'feishu' : 'wecom';
-  },
-  /* 不让考生卡在「正在通知考官」上：超时就当失败，转入本地队列稍后补发 */
-  sendTimeout(payload, ms) {
-    return Promise.race([
-      this.send(payload),
-      new Promise(res => setTimeout(() => res({ ok: false, mode: this.mode(), detail: '发送超时' }), ms || 15000))
-    ]);
-  },
-  /* ---- 群机器人：把结构化载荷排成人能读的消息 ---- */
-  /* 各家上限不同，超了对方直接拒收，所以按机器人类型分别留余量：
-     企业微信 text 上限 2048 字节，飞书宽松得多。
-     一律用 text 类型而不是 markdown——考生作文里可能有 * # 之类的符号，
-     markdown 会把它们当格式渲染，改变原文观感。 */
-  chunkBytes() { return this.bot() === 'feishu' ? 3500 : 1900; },
-  bytes(s) { return new Blob([s]).size; },
-
-  splitMessage(text) {
-    const LIMIT = this.chunkBytes();
-    if (this.bytes(text) <= LIMIT) return [text];
-    const lines = text.split('\n'), out = [];
-    let buf = '';
-    for (const ln of lines) {
-      if (buf && this.bytes(buf + '\n' + ln) > LIMIT) { out.push(buf); buf = ln; }
-      else buf = buf ? buf + '\n' + ln : ln;
-      /* 单行本身就超长（一整段写作往往没有换行），按字符硬切。
-         中英混排时字节数和字符数不成比例，所以按比例估算后再逐步收缩。 */
-      while (this.bytes(buf) > LIMIT) {
-        let cut = Math.max(1, Math.floor(buf.length * LIMIT / this.bytes(buf)));
-        while (cut > 1 && this.bytes(buf.slice(0, cut)) > LIMIT) cut--;
-        out.push(buf.slice(0, cut)); buf = buf.slice(cut);
-      }
-    }
-    if (buf) out.push(buf);
-    return out.map((t, i) => '（' + (i + 1) + '/' + out.length + '）\n' + t);
-  },
-
-  compose(d) {
-    const kw = (window.EET_CONFIG && EET_CONFIG.WEBHOOK_KEYWORD) || '英语测试';
-    if (d.kind === 'start') {
-      return ['【' + kw + '】开考',
-        '考生：' + d.name,
-        '开始时间：' + d.startedAt + (d.tz ? '（' + d.tz + '）' : ''),
-        '词汇量 ' + d.vocab + ' → ' + d.band + ' 卷（微调档 ' + d.neighbor + '）',
-        '试卷编号：' + d.code,
-        '构成：' + d.paper].join('\n');
-    }
-    if (d.kind === 'finish') {
-      const head = ['【' + kw + '】交卷',
-        '考生：' + d.name + '　编号 ' + d.code,
-        '用时 ' + (d.duration || '—') + '（' + d.startedAt + ' → ' + d.finishedAt + '）',
-        '阅读 ' + d.reading.correct + '/' + d.reading.total +
-        '　听力 ' + d.listening.correct + '/' + d.listening.total +
-        '　正确率 ' + d.percent + '%',
-        '推算水平：' + d.estLevel + '（约 ' + d.estVocab + ' 词）',
-        d.note || ''].join('\n');
-      const writing = (d.writing || []).map(w =>
-        '\n—— 写作 Task ' + w.task + '（' + w.words + ' 词 / 要求 ' + w.required + '）——\n' + w.text).join('\n');
-      const spk = (d.speaking || []);
-      const done = spk.filter(s => s.file).length;
-      const tail = '\n—— 口语 ——\n' + (done
-        ? done + ' 题已录音。群机器人发不了音频，请考生把结果包（zip）发给考官。'
-        : '未提交音频。');
-      return head + '\n' + writing + tail;
-    }
-    return '【' + kw + '】' + JSON.stringify(d).slice(0, 500);
-  },
-
-  async postWebhook(payload) {
-    const url = EET_CONFIG.WEBHOOK_URL;
-    const parts = this.splitMessage(this.compose(payload));
-    const isFeishu = this.bot() === 'feishu';
-    try {
-      for (const text of parts) {
-        const body = isFeishu
-          ? { msg_type: 'text', content: { text: text } }
-          : { msgtype: 'text', text: { content: text } };
-        /* 必须用 text/plain：application/json 会触发 CORS 预检，
-           而这两个 webhook 都不返回 CORS 头，预检必然失败、请求根本发不出去。
-           它们的服务端不校验 Content-Type，照样能解析 JSON 体。 */
-        await fetch(url, {
-          method: 'POST', mode: 'no-cors',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: JSON.stringify(body)
-        });
-      }
-      return { ok: true, mode: 'webhook', detail: '已推送 ' + parts.length + ' 条' };
-    } catch (e) {
-      return { ok: false, mode: 'webhook', detail: e.message };
-    }
-  },
-
-  send(payload) {
-    const mode = this.mode();
-    if (mode === 'webhook') return this.postWebhook(payload);
-    if (mode === 'gas') {
-      return new Promise(res => {
-        google.script.run
-          .withSuccessHandler(r => res({ ok: !!(r && r.ok), mode, detail: (r && (r.message || r.error)) || '' }))
-          .withFailureHandler(e => res({ ok: false, mode, detail: String((e && e.message) || e) }))
-          .relay(payload);
-      });
-    }
-    if (mode === 'http') {
-      /* text/plain + no-cors = 简单请求，不触发预检；Apps Script 不返回 CORS 头，
-         所以只能「发出即认为成功」，真正的确认靠考官收件箱 */
-      return fetch(EET_CONFIG.ENDPOINT_URL, {
-        method: 'POST', mode: 'no-cors',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(payload)
-      }).then(() => ({ ok: true, mode, detail: '已发出' }))
-        .catch(e => ({ ok: false, mode, detail: e.message }));
-    }
-    return Promise.resolve({ ok: false, mode: 'none', detail: '未配置邮件服务' });
-  },
-  /* 发送失败的通知先攒在本地，结果页可以一键补发（录音太大，不进队列） */
-  queue(payload) {
-    try {
-      const q = JSON.parse(localStorage.getItem('eet:mailq') || '[]');
-      q.push(payload);
-      localStorage.setItem('eet:mailq', JSON.stringify(q.slice(-20)));
-    } catch (e) { }
-  },
-  async flush() {
-    let q = [];
-    try { q = JSON.parse(localStorage.getItem('eet:mailq') || '[]'); } catch (e) { }
-    if (!q.length) return { sent: 0, left: 0 };
-    const left = [];
-    for (const p of q) { const r = await this.send(p); if (!r.ok) left.push(p); }
-    try { localStorage.setItem('eet:mailq', JSON.stringify(left)); } catch (e) { }
-    return { sent: q.length - left.length, left: left.length };
-  }
-};
+/* MAIL（群机器人 / 中转通道）与 copyText 在 notify.js，词汇量测试页共用同一份。 */
 
 /* ---------------------------------------------------------- 状态 ---- */
 const S = {
@@ -261,45 +108,107 @@ function neighborFor(band, vocab) {
   return band;
 }
 
+/* ---------------------------------------------------- 轮换出卷 ---- */
+/* 每月复测同一个人时，不能每次都随机抽——几轮下来必然撞上读过的文章。
+   轮次模式：按「姓名 | 档位 | 用途」给每个题池定一个固定排列（与试卷编号无关），
+   第 N 轮取排列里的第 N 段（每段 k 篇），取到末尾就绕回开头接着取。
+   所以 floor(题池/k) 轮之内绝不重复；绕回之后重复的也总是最久以前考过的那几篇。
+   相邻档借题同样按该档自己的固定排列取，所以借来的文章也不会逐月重复。
+   阅读：主档、借档每轮都是 1 篇，同一排列按轮次取，考生换档、角色互换也不会撞。
+   听力：主档每轮 3 段、借档每轮 1 段，步长不同。考生升档后原主档变成「下方借档」，
+   若按 1 段的步长取会撞上它当主档时用过的段落——所以下方借档按 3 段的步长对齐、取该段最后一段
+   （仅当这样不会缩短不重复轮数时才对齐，否则仍按 1 段步长取）。 */
+function roundKey(name) { return String(name || '').trim().toLowerCase().replace(/\s+/g, ' '); }
+function roundPick(pool, k, round, key) {
+  const len = pool.length;
+  if (!len || k <= 0) return [];
+  k = Math.min(k, len);
+  const order = pickSeeded(pool, len, mulberry32(hashStr(key)));   // 该考生该题池的固定排列
+  const out = [];
+  for (let j = 0; j < k; j++) {
+    const p = ((round - 1) * k + j) % len;
+    out.push(order[p]);
+  }
+  return out;
+}
+function roundsCovered(len, k) { return len && k > 0 ? Math.floor(len / Math.min(k, len)) : Infinity; }
+
 function buildExam(cfg) {
   const rnd = mulberry32(cfg.seed);
   const band = bandFor(cfg.vocab);
   const nb = neighborFor(band, cfg.vocab);
   const sameNb = nb.id === band.id;
+  const round = cfg.round >= 1 ? Math.floor(cfg.round) : 0;
+  const shorts = band.writing.filter(w => w.type === 'short');
+  const essays = band.writing.filter(w => w.type === 'essay');
+  let r1, r2, l1, l2, wTasks = [], sTasks, roundCover = 0, roundCoverWS = 0;
 
-  /* --- 阅读：主档 1 篇 + 相邻档 1 篇 --- */
-  const r1 = pickSeeded(band.reading, 1, rnd)[0];
-  const r2 = sameNb
-    ? pickSeeded(band.reading.filter(p => p !== r1), 1, rnd)[0]
-    : pickSeeded(nb.reading, 1, rnd)[0];
+  if (round) {
+    /* --- 轮次模式：不消耗 rnd，选项打乱仍由 rnd（试卷编号 + 词汇量）决定 --- */
+    const key = id => roundKey(cfg.name) + '|' + id;
+    const rk = sameNb ? 2 : 1, lk = sameNb ? 4 : 3;
+    const rs = roundPick(band.reading, rk, round, key(band.id) + '|reading');
+    r1 = rs[0];
+    r2 = sameNb ? (rs[1] || rs[0]) : roundPick(nb.reading, 1, round, key(nb.id) + '|reading')[0];
+    l1 = roundPick(band.listening, lk, round, key(band.id) + '|listening');
+    const nbBelow = EXAM_BANK.bands.indexOf(nb) < EXAM_BANK.bands.indexOf(band);
+    const alignL = nbBelow && roundsCovered(nb.listening.length, lk) >= roundsCovered(band.listening.length, lk);
+    l2 = sameNb ? [] : alignL
+      ? roundPick(nb.listening, lk, round, key(nb.id) + '|listening').slice(-1)
+      : roundPick(nb.listening, 1, round, key(nb.id) + '|listening');
+    if (cfg.writingCount >= 2) {
+      wTasks = [roundPick(shorts, 1, round, key(band.id) + '|w-short')[0],
+        roundPick(essays, 1, round, key(band.id) + '|w-essay')[0]].filter(Boolean);
+      if (wTasks.length < cfg.writingCount) {
+        const rest = band.writing.filter(w => wTasks.indexOf(w) < 0);
+        wTasks = wTasks.concat(roundPick(rest, cfg.writingCount - wTasks.length, round, key(band.id) + '|w-rest'));
+      }
+    } else {
+      wTasks = roundPick(essays.length ? essays : band.writing, 1, round, key(band.id) + '|w-essay');
+    }
+    const sk = Math.min(cfg.speakingCount, band.speaking.length);
+    sTasks = roundPick(band.speaking, sk, round, key(band.id) + '|speaking');
+    /* 当前题库能撑几轮不重复（取各题池的最小值；按当前档位算，换档后另算）。
+       阅读听力与写作口语分开算：前者重复了等于白考，后者重复的代价小得多 */
+    const covers = [roundsCovered(band.reading.length, rk), roundsCovered(band.listening.length, lk)];
+    if (!sameNb) covers.push(roundsCovered(nb.reading.length, 1), roundsCovered(nb.listening.length, alignL ? lk : 1));
+    const coversWS = [roundsCovered(essays.length, 1), roundsCovered(band.speaking.length, sk)];
+    if (cfg.writingCount >= 2) coversWS.push(roundsCovered(shorts.length, 1));
+    roundCover = Math.min.apply(null, covers);
+    roundCoverWS = Math.min.apply(null, coversWS);
+  } else {
+    /* --- 阅读：主档 1 篇 + 相邻档 1 篇 --- */
+    r1 = pickSeeded(band.reading, 1, rnd)[0];
+    r2 = sameNb
+      ? pickSeeded(band.reading.filter(p => p !== r1), 1, rnd)[0]
+      : pickSeeded(nb.reading, 1, rnd)[0];
+
+    /* --- 听力：主档 3 段 + 相邻档 1 段 --- */
+    l1 = pickSeeded(band.listening, sameNb ? 4 : 3, rnd);
+    l2 = sameNb ? [] : pickSeeded(nb.listening, 1, rnd);
+
+    /* --- 写作：主档，尽量一短一长 --- */
+    if (cfg.writingCount >= 2) {
+      wTasks = [pickSeeded(shorts, 1, rnd)[0], pickSeeded(essays, 1, rnd)[0]].filter(Boolean);
+      while (wTasks.length < cfg.writingCount) {
+        const rest = band.writing.filter(w => wTasks.indexOf(w) < 0);
+        if (!rest.length) break;
+        wTasks.push(pickSeeded(rest, 1, rnd)[0]);
+      }
+    } else {
+      wTasks = pickSeeded(essays.length ? essays : band.writing, 1, rnd);
+    }
+
+    /* --- 口语：主档 --- */
+    sTasks = pickSeeded(band.speaking, Math.min(cfg.speakingCount, band.speaking.length), rnd);
+  }
+
   const readingItems = [
     { src: band.cefr, title: r1.title, text: r1.text, qs: r1.questions },
     { src: nb.cefr, title: r2.title, text: r2.text, qs: r2.questions }
   ];
-
-  /* --- 听力：主档 3 段 + 相邻档 1 段 --- */
-  const l1 = pickSeeded(band.listening, sameNb ? 4 : 3, rnd);
-  const l2 = sameNb ? [] : pickSeeded(nb.listening, 1, rnd);
   const listeningItems = l1.map(x => ({ src: band.cefr, title: x.title, lines: x.lines, qs: x.questions }))
     .concat(l2.map(x => ({ src: nb.cefr, title: x.title, lines: x.lines, qs: x.questions })));
-
-  /* --- 写作：主档，尽量一短一长 --- */
-  const shorts = band.writing.filter(w => w.type === 'short');
-  const essays = band.writing.filter(w => w.type === 'essay');
-  let wTasks = [];
-  if (cfg.writingCount >= 2) {
-    wTasks = [pickSeeded(shorts, 1, rnd)[0], pickSeeded(essays, 1, rnd)[0]].filter(Boolean);
-    while (wTasks.length < cfg.writingCount) {
-      const rest = band.writing.filter(w => wTasks.indexOf(w) < 0);
-      if (!rest.length) break;
-      wTasks.push(pickSeeded(rest, 1, rnd)[0]);
-    }
-  } else {
-    wTasks = pickSeeded(essays.length ? essays : band.writing, 1, rnd);
-  }
-
-  /* --- 口语：主档 --- */
-  const sTasks = pickSeeded(band.speaking, Math.min(cfg.speakingCount, band.speaking.length), rnd);
 
   /* --- 编号 & 展开题号 --- */
   let n = 0;
@@ -316,6 +225,7 @@ function buildExam(cfg) {
     name: cfg.name,
     vocab: cfg.vocab,
     seed: cfg.seed,
+    round: round, roundCover: roundCover, roundCoverWS: roundCoverWS,
     date: todayStr(),
     band: band, neighbor: nb,
     reading: { minutes: READ_MINUTES[band.id] || 30, items: readingItems },
@@ -471,7 +381,7 @@ function stopTimer() {
 function examMeta() {
   const e = S.exam;
   return {
-    code: e.code, name: e.name || '(未署名)', vocab: e.vocab,
+    code: e.code, name: e.name || '(未署名)', vocab: e.vocab, round: e.round || 0,
     band: e.band.cefr + ' · ' + e.band.name,
     neighbor: e.neighbor.cefr,
     paper: e.reading.items.length + ' 篇阅读 / ' + totalQs(e.reading) + ' 题，'
@@ -521,6 +431,7 @@ async function notifyFinish(onProgress) {
     percent: Math.round(r.pct * 100),
     estLevel: r.estBand.cefr + ' · ' + r.estBand.name,
     estVocab: r.estVocab, note: r.note,
+    scoreCode: examScoreCode(),
     writing: e.writing.tasks.map((t, i) => ({
       task: i + 1, required: t.minWords + '-' + t.maxWords,
       words: words(S.ans.writing[i] || ''), prompt: t.prompt, text: S.ans.writing[i] || '(未作答)'
@@ -534,6 +445,31 @@ async function notifyFinish(onProgress) {
   if (!res.ok && res.mode !== 'none') { const light = Object.assign({}, payload); delete light.reportHtml; MAIL.queue(light); }
   persist();
   return res;
+}
+
+/* 成绩码：一行纯文本，方便考生贴进外部的月度登记表。字段用 | 分隔，字段内的 | 和换行替换掉 */
+function codeField(x) { return String(x == null ? '' : x).replace(/[|\r\n]+/g, '/').trim(); }
+function examScoreCode() {
+  const e = S.exam, r = S.result;
+  return ['EXAM', codeField(e.name || '未署名'), codeField(e.code), e.round || '-', e.date, e.band.cefr,
+    '阅读' + r.reading.correct + '/' + r.reading.total,
+    '听力' + r.listening.correct + '/' + r.listening.total].join('|');
+}
+function scoreCodeHTML(code) {
+  return `<div class="scorecode">
+    <span class="small muted">成绩码</span>
+    <code id="score-code">${esc(code)}</code>
+    <button class="ghost small" id="btn-copycode">复制</button>
+    <span class="small tick hidden" id="copy-ok">✔ 已复制</span>
+  </div>`;
+}
+function bindScoreCode(code) {
+  const b = $('#btn-copycode'); if (!b) return;
+  b.onclick = () => copyText(code).then(ok => {
+    const t = $('#copy-ok'); if (!t) return;
+    t.textContent = ok ? '✔ 已复制' : '复制失败，请手动选中复制';
+    t.classList.remove('hidden');
+  });
 }
 
 function durationText() {
@@ -576,7 +512,7 @@ function go(screen) {
 function updateTopMeta() {
   const m = $('#topmeta');
   if (!S.exam || S.screen === 'setup') { m.textContent = ''; return; }
-  m.innerHTML = esc(S.exam.name || '考生') + ' · ' + esc(S.exam.band.cefr) + ' 卷<br><span style="opacity:.7">编号 ' + esc(S.exam.code) + '</span>';
+  m.innerHTML = esc(S.exam.name || '考生') + ' · ' + esc(S.exam.band.cefr) + ' 卷<br><span style="opacity:.7">编号 ' + esc(S.exam.code) + (S.exam.round ? ' · 第 ' + S.exam.round + ' 轮' : '') + '</span>';
 }
 
 /* ========================================================== 1. 设置 ==== */
@@ -584,11 +520,14 @@ function renderSetup() {
   const lastCode = localStorage.getItem('eet:last');
   const saved = lastCode ? loadSaved(lastCode) : null;
   const resumable = saved && !saved.submitted;
+  const pre = setupPrefill();
 
   APP.innerHTML = `
   <div class="card">
     <h1>创建一份英语能力测试卷</h1>
     <p class="lead">输入考生的大致词汇量，系统按对应水平档位出卷。同一个「试卷编号」永远生成同一份卷子，方便复测与对照。</p>
+    <p class="small muted" style="margin:-10px 0 16px">不清楚词汇量？可以先做一次 <a href="vocab.html">词汇量测试</a>（100 词，约 10–15 分钟），做完可一键带回本页。</p>
+    ${pre.vocab ? `<div class="notice small">已带入词汇量 <b>${esc(pre.vocab)}</b>${pre.name ? '（考生 ' + esc(pre.name) + '）' : ''}，确认其余设置后点「生成试卷」即可。</div>` : ''}
 
     ${resumable ? `<div class="notice">检测到一份未完成的答卷：<b>${esc(saved.cfg.name || '未署名')}</b>（编号 ${esc(saved.cfg.code)}，词汇量 ${saved.cfg.vocab}）。
       <button class="ghost small" id="btn-resume" style="margin-left:8px">继续作答</button>
@@ -603,6 +542,11 @@ function renderSetup() {
         <label for="f-vocab">词汇量（个）</label>
         <input type="number" id="f-vocab" min="300" max="30000" step="100" value="4000">
         <div class="hint">这个数字决定卷子的难度档位。</div>
+      </div>
+      <div class="field">
+        <label for="f-round">轮次（可选）</label>
+        <input type="number" id="f-round" min="1" max="999" step="1" placeholder="例：1">
+        <div class="hint">每月复测填 1、2、3…：同一考生按固定顺序轮换文章，连续几轮不重复（相邻档借题也一样轮换）。需填姓名；留空 = 普通随机出卷。</div>
       </div>
     </div>
 
@@ -666,10 +610,18 @@ function renderSetup() {
     sel.onchange = () => TTS.setVoice(sel.value);
   });
 
+  if (pre.name) $('#f-name').value = pre.name;
+  if (pre.vocab) $('#f-vocab').value = pre.vocab;
+  if (pre.code) $('#f-seed').value = pre.code;
+  if (pre.round) $('#f-round').value = pre.round;
+
   $('#btn-make').onclick = () => {
     const name = $('#f-name').value.trim();
     const vocab = parseInt($('#f-vocab').value, 10);
     if (!vocab || vocab < 100) { alert('请输入一个合理的词汇量数字（例如 4000）。'); return; }
+    const round = parseInt($('#f-round').value, 10) || 0;
+    if (round < 0) { alert('轮次请填 1 以上的整数，或留空。'); return; }
+    if (round && !name) { alert('轮次模式按考生姓名固定轮换顺序，请先填写考生姓名。'); $('#f-name').focus(); return; }
     let seedText = $('#f-seed').value.trim();
     if (!seedText) seedText = todayStr().replace(/-/g, '').slice(4) + '-' + Math.random().toString(36).slice(2, 5).toUpperCase();
     const cfg = {
@@ -683,6 +635,7 @@ function renderSetup() {
       practice: $('#f-practice').checked,
       voiceURI: TTS.voice ? TTS.voice.voiceURI : ''
     };
+    if (round) cfg.round = round;
     S.cfg = cfg;
     S.exam = buildExam(cfg);
     S.ans = { reading: {}, listening: {}, writing: [], speaking: [] };
@@ -706,6 +659,20 @@ function renderSetup() {
   }
 }
 
+/* 出卷页预填：词汇量测试结果页「带回」用 ?vocab=&name=&code=，也可手写 ?round=。
+   注意和考生直达链接的 ?v= 区分——那个直接进须知页，这个只是把表单填好。 */
+function setupPrefill() {
+  const p = urlParams(), out = {};
+  if (p.v) return out;                 // 考生直达链接，不是预填
+  const v = parseInt(p.vocab, 10);
+  if (v >= 100) out.vocab = v;
+  const r = parseInt(p.round, 10);
+  if (r >= 1) out.round = r;
+  if (p.name) out.name = String(p.name).trim().slice(0, 60);
+  if (p.code) out.code = String(p.code).trim().slice(0, 60);
+  return out;
+}
+
 function renderPreview() {
   const e = S.exam;
   const nbNote = e.neighbor.id === e.band.id ? '（无相邻档，全部取自本档）' : `，另有 1 篇阅读 + 1 段听力取自 <b>${e.neighbor.cefr}</b> 档用于拉开区分度`;
@@ -716,6 +683,7 @@ function renderPreview() {
     <dl class="kv">
       <dt>试卷编号</dt><dd>${esc(e.code)}</dd>
       <dt>考生</dt><dd>${esc(e.name || '（未填写）')}</dd>
+      ${e.round ? `<dt>轮次</dt><dd>第 ${e.round} 轮 · 按姓名固定轮换。按当前题库与档位：阅读/听力连续 ${e.roundCover} 轮不重复，写作/口语连续 ${e.roundCoverWS} 轮不重复，之后从最早考过的开始循环</dd>` : ''}
       <dt>阅读</dt><dd>${e.reading.items.length} 篇文章 · ${totalQs(e.reading)} 题选择 · ${e.reading.minutes} 分钟</dd>
       <dt>听力</dt><dd>${e.listening.items.length} 段材料 · ${totalQs(e.listening)} 题选择 · 每段可播 ${S.cfg.playLimit >= 99 ? '不限' : S.cfg.playLimit} 次</dd>
       <dt>写作</dt><dd>${e.writing.tasks.length} 题 · 共 ${e.writing.minutes} 分钟</dd>
@@ -735,6 +703,7 @@ function renderPreview() {
   $('#btn-link').onclick = () => {
     const p = new URLSearchParams({ v: String(e.vocab), code: e.code, w: String(S.cfg.writingCount), s: String(S.cfg.speakingCount), p: String(S.cfg.playLimit) });
     if (e.name) p.set('name', e.name);
+    if (e.round) p.set('round', String(e.round));
     const link = baseUrl() + '?' + p.toString();
     const out = $('#link-out');
     out.innerHTML = '把这个链接发给考生，他打开就能直接考（无需填任何设置）：<br><code style="word-break:break-all">' + esc(link) + '</code>';
@@ -783,6 +752,8 @@ function renderBrief() {
       const n = $('#f-cname').value.trim();
       if (!n) { alert('请先填写姓名。'); $('#f-cname').focus(); return; }
       S.exam.name = n; S.cfg.name = n;
+      /* 轮次模式按姓名定轮换顺序：链接里没带姓名时，填完姓名要按姓名重新出卷（此时尚未作答） */
+      if (S.cfg.round) S.exam = buildExam(S.cfg);
     }
     const st = $('#brief-mail'); if (st) st.textContent = '正在通知考官…';
     notifyStart().then(() => go('reading'), () => go('reading'));
@@ -1209,7 +1180,7 @@ function renderResult() {
   let html = `
   <div class="card">
     <h1>测试结果</h1>
-    <p class="lead">${esc(e.name || '考生')} · 试卷编号 ${esc(e.code)} · ${esc(e.date)} · 按词汇量 ${e.vocab} 出的 ${esc(e.band.cefr)} 卷</p>
+    <p class="lead">${esc(e.name || '考生')} · 试卷编号 ${esc(e.code)}${e.round ? ' · 第 ' + e.round + ' 轮' : ''} · ${esc(e.date)} · 按词汇量 ${e.vocab} 出的 ${esc(e.band.cefr)} 卷</p>
     <div class="scorebar">
       <div class="scorecard"><div class="l">Reading 阅读</div><div class="n">${r.reading.correct}<span class="muted" style="font-size:16px"> / ${r.reading.total}</span></div></div>
       <div class="scorecard"><div class="l">Listening 听力</div><div class="n">${r.listening.correct}<span class="muted" style="font-size:16px"> / ${r.listening.total}</span></div></div>
@@ -1220,6 +1191,7 @@ function renderResult() {
       <div class="lv">${esc(r.estBand.cefr)} · ${esc(r.estBand.name)}</div>
       <div class="small">对应词汇量约 ${esc(r.estVocab)} 词。${esc(r.note)}</div>
     </div>
+    ${scoreCodeHTML(examScoreCode())}
     ${audioHandoffHTML()}
     ${mailStatusHTML()}
     <div class="actions">
@@ -1259,6 +1231,7 @@ function renderResult() {
   </div>`;
 
   APP.innerHTML = html;
+  bindScoreCode(examScoreCode());
   if ($('#btn-zip')) $('#btn-zip').onclick = exportZip;
   if ($('#btn-resend')) $('#btn-resend').onclick = async () => {
     const b = $('#btn-resend'); b.disabled = true; b.textContent = '正在补发…';
@@ -1333,7 +1306,7 @@ function openPrintable() {
   const e = S.exam;
   const key = [];
   let h = `<h1>English Proficiency Test</h1>
-  <p>考生：${esc(e.name || '____________')}　词汇量设定：${e.vocab}　档位：${esc(e.band.cefr)}　试卷编号：${esc(e.code)}　日期：${esc(e.date)}</p>
+  <p>考生：${esc(e.name || '____________')}　词汇量设定：${e.vocab}　档位：${esc(e.band.cefr)}　试卷编号：${esc(e.code)}${e.round ? '　轮次：第 ' + e.round + ' 轮' : ''}　日期：${esc(e.date)}</p>
   <h2>Part 1 · Reading（${e.reading.minutes} 分钟）</h2>`;
   e.reading.items.forEach((it, i) => {
     h += `<h3>Passage ${i + 1} — ${esc(it.title)}</h3><div class="p">${esc(it.text)}</div>`;
@@ -1436,7 +1409,8 @@ async function exportZip() {
     files.push({ name: '成绩报告.html', data: enc.encode(reportHTML(r)) });
     files.push({
       name: '作答数据.json', data: enc.encode(JSON.stringify({
-        candidate: e.name, date: e.date, code: e.code, vocabInput: e.vocab,
+        candidate: e.name, date: e.date, code: e.code, round: e.round || null, vocabInput: e.vocab,
+        scoreCode: examScoreCode(),
         paperBand: e.band.cefr, neighborBand: e.neighbor.cefr,
         reading: r.reading, listening: r.listening,
         objectivePercent: Math.round(r.pct * 100),
@@ -1498,7 +1472,8 @@ h1{font-size:22px}h2{font-size:18px;border-bottom:1px solid #ddd;padding-bottom:
 th,td{border:1px solid #e2e6ea;padding:7px 10px;text-align:left;vertical-align:top}th{background:#f3f5f7;white-space:nowrap}
 </style></head><body>
 <h1>英语能力测试 · 成绩报告</h1>
-<p>考生：<b>${esc(e.name || '（未署名）')}</b>　日期：${esc(e.date)}　试卷编号：${esc(e.code)}　设定词汇量：${e.vocab}　卷面档位：${esc(e.band.cefr)}</p>
+<p>考生：<b>${esc(e.name || '（未署名）')}</b>　日期：${esc(e.date)}　试卷编号：${esc(e.code)}${e.round ? '　轮次：第 ' + e.round + ' 轮' : ''}　设定词汇量：${e.vocab}　卷面档位：${esc(e.band.cefr)}</p>
+<p class="muted">成绩码：${esc(examScoreCode())}</p>
 <p class="muted">开始 ${esc(S.startedAt || '—')}　结束 ${esc(S.finishedAt || '—')}　用时 ${esc(durationText() || '—')}</p>
 <div class="box">
   <div class="muted">客观题推算水平（不含写作口语）</div>
@@ -1542,6 +1517,8 @@ function boot() {
       practice: false,
       voiceURI: ''
     };
+    const round = parseInt(p.round, 10);
+    if (round >= 1) S.cfg.round = round;
     S.exam = buildExam(S.cfg);
     S.ans = { reading: {}, listening: {}, writing: [], speaking: [] };
     S.plays = {};
