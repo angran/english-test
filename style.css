@@ -154,6 +154,26 @@ table.rubric th{background:#f3f5f7;font-weight:600;white-space:nowrap}
 .notice{background:#fff8e6;border:1px solid #f0dca4;border-radius:7px;padding:10px 14px;font-size:14px;margin-bottom:14px}
 .notice.bad{background:#fdeeed;border-color:#f2c3c0}
 
+/* ---- 成绩码（考试与词汇量测试共用） ---- */
+.scorecode{display:flex;align-items:center;gap:10px;flex-wrap:wrap;border:1px dashed #c6ccd2;border-radius:8px;padding:10px 14px;margin:14px 0;background:#fcfcfd}
+.scorecode code{font-family:ui-monospace,Consolas,monospace;font-size:13px;word-break:break-all;flex:1 1 260px;user-select:all}
+a{color:var(--brand)}
+
+/* ---- 词汇量测试 ---- */
+.vprog{height:6px;background:#e8ebee;border-radius:3px;overflow:hidden;margin:4px 0 18px}
+.vprog i{display:block;height:100%;background:var(--brand);transition:width .2s}
+.vword{font-family:var(--serif);font-size:38px;font-weight:700;text-align:center;margin:10px 0 22px;letter-spacing:.5px}
+.vopts{max-width:460px;margin:0 auto}
+.vopts .opt{font-size:17px;padding:10px 14px}
+.vopts .opt.idk{color:var(--ink-soft);border-style:dashed}
+.vbars{margin:12px 0 4px}
+.vbar{display:grid;grid-template-columns:44px 1fr 64px;align-items:center;gap:10px;font-size:13px;margin-bottom:6px}
+.vbar .track{height:14px;background:#eef1f4;border-radius:7px;overflow:hidden}
+.vbar .fill{height:100%;background:var(--brand);border-radius:7px}
+.vbar .fill.mid{background:#4f8fb8}
+.vbar .fill.low{background:#a9c6da}
+.vbar .num{text-align:right;color:var(--ink-soft);font-variant-numeric:tabular-nums}
+
 footer{border-top:1px solid var(--line);padding:16px 0;font-size:12px;color:var(--ink-soft);text-align:center;background:#fff}
 
 @media (max-width:640px){
